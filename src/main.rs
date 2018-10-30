@@ -113,10 +113,9 @@ struct Opt {
     #[structopt(long = "size")]
     size: Option<usize>,
 
-    #[structopt(
-        raw(
-            possible_values = "&Command::variants()",
-            requires_ifs = r#"&[
+    #[structopt(raw(
+        possible_values = "&Command::variants()",
+        requires_ifs = r#"&[
 ("Create", "capacity"),
 ("Put", "lumpid"),("Put", "data"),
 ("Get", "lumpid"),
@@ -124,8 +123,7 @@ struct Opt {
 ("WBench", "count"),("WBench", "size"),
 ("WRBench", "count"),("WRBench", "size")
 ]"#
-        )
-    )]
+    ))]
     command: Command,
 }
 
@@ -156,6 +154,7 @@ fn handle_input(handle: &mut StorageHandle, input: &str) {
     let put_regex = Regex::new(r"^put\s+([0-9]+)\s+([^\x00]+)$").unwrap();
     let get_regex = Regex::new(r"^get\s+([0-9]+)$").unwrap();
     let delete_regex = Regex::new(r"^delete\s*([0-9]+)$").unwrap();
+    let metrics_server = Regex::new(r"^start_metrics_server\s*([0-9]+)$").unwrap();
 
     if let Some(captured) = put_regex.captures(&input) {
         let key: u128 = captured.get(1).unwrap().as_str().parse().unwrap();
@@ -172,6 +171,9 @@ fn handle_input(handle: &mut StorageHandle, input: &str) {
     } else if let Some(captured) = delete_regex.captures(&input) {
         let key: u128 = captured.get(1).unwrap().as_str().parse().unwrap();
         handle.delete(key);
+    } else if let Some(captured) = metrics_server.captures(&input) {
+        let port: u16 = captured.get(1).unwrap().as_str().parse().unwrap();
+        handle.start_metrics_server(port);
     } else if input == "list" {
         handle.print_list_of_lumpids();
     } else if input == "dump" {
@@ -182,6 +184,18 @@ fn handle_input(handle: &mut StorageHandle, input: &str) {
         handle.print_journal_info();
     } else if input == "journal_gc" {
         handle.journal_gc();
+    } else if input == "metrics" {
+        if let Some(metrics_txt) = handle.metrics() {
+            println!("<metrics>");
+            println!("{}", metrics_txt);
+            println!("</metrics>");
+        } else {
+            println!("Failed to get metrics data");
+        }
+    } else if input == "start_metrics_server" {
+        handle.start_metrics_server(8029);
+    } else if input == "finish_metrics_server" {
+        handle.finish_metrics_server();
     } else {
         println!("`{}` is an invalid command", input);
     }

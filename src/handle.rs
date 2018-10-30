@@ -3,6 +3,10 @@ use cannyls::lump::{LumpData, LumpId};
 use cannyls::nvm::FileNvm;
 use cannyls::storage::{JournalSnapshot, Storage, StorageBuilder};
 
+use fibers::sync::oneshot;
+use fibers_http_server::metrics::MetricsHandler;
+use fibers_http_server::ServerBuilder;
+use futures::Future;
 use std::path::Path;
 use std::str;
 
@@ -12,41 +16,128 @@ fn lumpdata_to_string(data: &LumpData) -> String {
 
 pub struct StorageHandle {
     storage: Storage<FileNvm>,
+    tx: Option<oneshot::Sender<()>>,
+    port: Option<u16>,
 }
 
 impl StorageHandle {
+    /// CannyLSの集めているメトリクスデータを
+    /// 改行区切りの文字列として返す
+    pub fn metrics(&self) -> Option<String> {
+        let mut lock = prometrics::default_gatherer().try_lock();
+
+        if let Ok(ref mut mutex) = lock {
+            return Some(mutex.gather().to_text());
+        } else {
+            return None;
+        }
+    }
+
+    /// CannyLSの集めているメトリクスデータを
+    /// Prometheusがpullするためのサーバを起動する。
+    ///
+    /// 引数 `port` は、メトリクスサーバをbindするためのポート番号として用いられる。
+    pub fn start_metrics_server(&mut self, port: u16) {
+        if self.tx.is_some() {
+            println!(
+                "The metrics server is already running with the port {}.",
+                self.port.unwrap()
+            );
+            println!(
+                "Please visit http://localhost:{}/metrics .",
+                self.port.unwrap()
+            );
+            return;
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let addr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let mut builder = ServerBuilder::new(addr);
+        builder.add_handler(MetricsHandler).unwrap();
+
+        let server = builder.finish(fibers_global::handle());
+        fibers_global::spawn(server.select2(rx).map(|_| ()).map_err(|_| ()));
+
+        self.tx = Some(tx);
+        self.port = Some(port);
+
+        println!("Start our metrics server on the port {}.", port);
+        println!(
+            "Please visit http://localhost:{}/metrics .",
+            self.port.unwrap()
+        );
+    }
+
+    /// `start_metrics_server` で起動したメトリクスサーバを
+    /// 終了させる。
+    pub fn finish_metrics_server(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            println!("finishing the metrics server...");
+            tx.send(()).unwrap();
+            println!("done!");
+        } else {
+            println!("The metrics server is not running");
+        }
+    }
+
     pub fn new(storage: Storage<FileNvm>) -> Self {
-        StorageHandle { storage }
+        StorageHandle {
+            storage,
+            tx: None,
+            port: None,
+        }
     }
 
     pub fn create<T: AsRef<Path>>(path: T) -> Self {
         let nvm = track_try_unwrap!(FileNvm::open(path));
         let storage = track_try_unwrap!(StorageBuilder::new().open(nvm));
-        StorageHandle { storage }
+        StorageHandle {
+            storage,
+            tx: None,
+            port: None,
+        }
     }
 
+    /// `u128型`の値`key`からLumpIDを生成し、文字列`value`をLumpDataに変換し
+    /// これらの組からなるLumpをPUTする。
+    ///
+    /// 返り値はそれぞれ次を意味する:
+    /// - Ok(true): PUTに成功した。特に「新規書き込み」が行われた。
+    /// - Ok(false): PUTに成功した。特に「上書き」が行われた。
+    /// - Err: CannyLSのレベルでエラーが発生した。
     pub fn put_str(&mut self, key: u128, value: &str) -> Result<bool, cannyls::Error> {
         let lump_id = LumpId::new(key);
         let lump_data =
             track_try_unwrap!(self.storage.allocate_lump_data_with_bytes(value.as_bytes()));
         self.storage.put(&lump_id, &lump_data)
     }
+
+    /// `u128型`の値`key`と文字列`value`からLumpを作りPUTする。
+    ///
+    /// 内部で`put_str`を呼び出し、新規書き込み `new` であったか、上書き `overwrite` であったかを区別する。
     pub fn put(&mut self, key: u128, value: &str) {
         let result = track_try_unwrap!(self.put_str(key, value));
 
         if result {
-            println!("put key={}, value={}", key, value);
+            println!("[new] put key={}, value={}", key, value);
         } else {
             println!("[overwrite] put key={}, value={}", key, value);
         }
     }
 
+    /// `u128型`の値`key`からLumpIDを生成し、そのLumpIDに紐付いたデータを取得する。
+    ///
+    /// 返り値はそれぞれ次を意味する:
+    /// - `Ok(Some(string))`: `string`がストアされていた。
+    /// - `Ok(None)`: `key`のLumpIDを持つLumpは存在しなかった。
+    /// - `None`: CannyLSのレベルでエラーが発生した。
     pub fn get_string(&mut self, key: u128) -> Result<Option<String>, cannyls::Error> {
         let lump_id = LumpId::new(key);
         self.storage
             .get(&lump_id)
             .map(|s| s.map(|s| lumpdata_to_string(&s)))
     }
+    /// `u128型`の値`key`からLumpIDを生成し、そのLumpIDに紐付いたデータを出力する。
     pub fn get(&mut self, key: u128) {
         let result = track_try_unwrap!(self.get_string(key));
         if let Some(string) = result {
@@ -56,10 +147,17 @@ impl StorageHandle {
         }
     }
 
+    /// `u128型`の値`key`からLumpIDを生成し、そのLumpIDに紐付いたデータを削除する。
+    ///
+    /// 返り値はそれぞれ次を意味する:
+    /// - `Ok(true)`: `key`のLumpIDを持つLumpが存在しており、削除された。
+    /// - `Ok(false)`: `key`のLumpIDを持つLumpは存在しなかった。
+    /// - `None`: CannyLSのレベルでエラーが発生した。
     pub fn delete_key(&mut self, key: u128) -> Result<bool, cannyls::Error> {
         let lump_id = LumpId::new(key);
         self.storage.delete(&lump_id)
     }
+    /// `u128型`の値`key`からLumpIDを生成し、そのLumpIDに紐付いたデータを削除し、結果を出力する。
     pub fn delete(&mut self, key: u128) {
         let result = track_try_unwrap!(self.delete_key(key));
         println!("delete result => {:?}", result);
